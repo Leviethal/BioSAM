@@ -1,0 +1,11 @@
+opencv-python
+pycocotools
+matplotlib
+onnxruntime
+onnx
+pillow
+torch
+torchvision
+torchaudio
+numpy
+segment-anything

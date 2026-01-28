@@ -9,3 +9,4 @@ torchvision
 torchaudio
 numpy
 segment-anything
+scikit-image

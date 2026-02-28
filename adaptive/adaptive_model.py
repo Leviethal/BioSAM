@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from segment_anything import sam_model_registry
+
 
 class AdaptiveSAM(nn.Module):
     def __init__(self, sam_ckpt, medsam_ckpt, device="cuda"):
@@ -8,7 +10,7 @@ class AdaptiveSAM(nn.Module):
 
         self.device = device
 
-        # Load base SAM
+        # Load SAM
         self.sam = sam_model_registry["vit_b"](checkpoint=sam_ckpt)
 
         # Load MedSAM
@@ -22,56 +24,80 @@ class AdaptiveSAM(nn.Module):
         self.sam.eval()
         self.medsam.eval()
 
-        # Freeze everything
+        # Freeze all weights
         for p in self.sam.parameters():
             p.requires_grad = False
         for p in self.medsam.parameters():
             p.requires_grad = False
 
-        # Number of transformer blocks
+        # Per-layer alpha (ViT-B has 12 blocks)
         num_blocks = len(self.sam.image_encoder.blocks)
-
-        # Learnable alpha per block
         self.alpha = nn.Parameter(torch.zeros(num_blocks))
 
-    def forward(self, x, boxes):
+        # SAM normalization constants
+        self.pixel_mean = torch.tensor(
+            [123.675, 116.28, 103.53], device=device
+        ).view(1, 3, 1, 1)
 
-        image_encoder_sam = self.sam.image_encoder
-        image_encoder_med = self.medsam.image_encoder
+        self.pixel_std = torch.tensor(
+            [58.395, 57.12, 57.375], device=device
+        ).view(1, 3, 1, 1)
+
+    def forward(self, image, boxes):
+
+        # image: [B, 3, H, W]
+        B, C, H, W = image.shape
+
+        # Resize to SAM input size
+        target_size = self.sam.image_encoder.img_size
+        image = F.interpolate(
+            image,
+            size=(target_size, target_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # Normalize
+        image = (image - self.pixel_mean) / self.pixel_std
+
+        enc_sam = self.sam.image_encoder
+        enc_med = self.medsam.image_encoder
 
         # Patch embedding
-        x_sam = image_encoder_sam.patch_embed(x)
-        x_med = image_encoder_med.patch_embed(x)
+        x_sam = enc_sam.patch_embed(image)
+        x_med = enc_med.patch_embed(image)
 
-        x_sam = x_sam + image_encoder_sam.pos_embed
-        x_med = x_med + image_encoder_med.pos_embed
+        x_sam = x_sam + enc_sam.pos_embed
+        x_med = x_med + enc_med.pos_embed
 
-        # Transformer blocks
+        # ---- Per-layer residual fusion ----
         for i, (block_s, block_m) in enumerate(
-            zip(image_encoder_sam.blocks, image_encoder_med.blocks)
+            zip(enc_sam.blocks, enc_med.blocks)
         ):
-            a = torch.sigmoid(self.alpha[i])
-
             out_s = block_s(x_sam)
             out_m = block_m(x_med)
 
-            # Feature-level merge (CRITICAL FIX)
-            x = a * out_s + (1 - a) * out_m
+            a = torch.sigmoid(self.alpha[i])
 
+            # Residual-style interpolation (SAFE)
+            x = out_s + a * (out_m - out_s)
+
+            # Keep both streams aligned for next layer
             x_sam = x
             x_med = x
 
-        # Convert format
+        # Neck
         x = x.permute(0, 3, 1, 2)
-        x = image_encoder_sam.neck(x)
+        x = enc_sam.neck(x)
 
-        # Prompt + decoder
+        # Prompt encoding
         sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
             points=None,
             boxes=boxes,
             masks=None,
         )
 
+        # Mask decoding
         low_res_masks, _ = self.sam.mask_decoder(
             image_embeddings=x,
             image_pe=self.sam.prompt_encoder.get_dense_pe(),

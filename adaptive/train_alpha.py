@@ -13,7 +13,7 @@ SAM_CKPT = "sam_vit_b_01ec64.pth"
 MEDSAM_CKPT = "medsam_vit_b.pth"
 DEVICE = "cuda"
 EPOCHS = 10
-LR = 0.01
+LR = 0.001
 CHECKPOINT_DIR = "adaptive/checkpoints"
 # ==========================================
 
@@ -33,23 +33,27 @@ class CalibDataset(Dataset):
         img = cv2.imread(os.path.join(CALIB_IMAGE_DIR, f), 0)
         mask = cv2.imread(os.path.join(CALIB_MASK_DIR, f), 0)
 
-        img = cv2.resize(img, (1024, 1024))
-        mask = cv2.resize(mask, (1024, 1024), interpolation=cv2.INTER_NEAREST)
+        # DO NOT resize image
+        # DO NOT normalize
+        # DO NOT apply pixel mean/std
 
-        img = img.astype(np.float32) / 255.0
+        img = img.astype(np.float32)
+
+        # Convert grayscale → 3-channel
+        img = np.stack([img, img, img], axis=0)  # (3, H, W)
+
         mask = (mask > 127).astype(np.float32)
 
-        img = np.stack([img, img, img], axis=0)
-
-        return torch.tensor(img), torch.tensor(mask).unsqueeze(0)
+        return torch.tensor(img, dtype=torch.float32), \
+            torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
 
 
 def dice_loss(pred, target, smooth=1e-5):
     pred = torch.sigmoid(pred)
-    intersection = (pred * target).sum()
-    return 1 - (2 * intersection + smooth) / (
-        pred.sum() + target.sum() + smooth
-    )
+    intersection = (pred * target).sum(dim=(2,3))
+    union = pred.sum(dim=(2,3)) + target.sum(dim=(2,3))
+    dice = (2 * intersection + smooth) / (union + smooth)
+    return 1 - dice.mean()
 
 
 def get_box(mask):
@@ -58,7 +62,7 @@ def get_box(mask):
     y_max = coords[:, 0].max()
     x_min = coords[:, 1].min()
     x_max = coords[:, 1].max()
-    return torch.tensor([[x_min, y_min, x_max, y_max]], dtype=torch.float)
+    return torch.stack([x_min, y_min, x_max, y_max]).unsqueeze(0).float()
 
 
 def save_checkpoint(model, optimizer, epoch, best_loss):
@@ -103,17 +107,16 @@ def main():
             img = img.to(DEVICE)
             mask = mask.to(DEVICE)
 
-            boxes = get_box(mask.cpu()).to(DEVICE)
+            boxes = get_box(mask)
 
             optimizer.zero_grad()
 
             pred = model(img, boxes)
 
-            pred = torch.nn.functional.interpolate(
-                pred,
-                size=(1024, 1024),
-                mode="bilinear",
-                align_corners=False
+            mask = torch.nn.functional.interpolate(
+                mask,
+                size=pred.shape[-2:], 
+                mode="nearest"
             )
 
             loss = dice_loss(pred, mask)
